@@ -39,16 +39,19 @@ func (p *PingPayload) Encode() []byte {
 	// 근데 왜 BigEndian을 쓸까. 
 	// 네트워크 표준이 BigEndiand 이라고 한다
 	// 다른 컴퓨터와 통신할 때 바이트 순서가 같아야한다고 한다
+	// 숫자르 바이트로 저장!!!
 	binary.BigEndian.PutUint64(buf, p.Nonce)
 	return buf
 }
 
 // DecodePingPayload는 바이트 슬라이스에서 PingPayload를 디코딩합니다.
+// 
 func DecodePingPayload(data []byte) (*PingPayload, error) {
 	if len(data) < 8 {
 		return nil, fmt.Errorf("Ping 데이터 부족: %d < 8", len(data))
 	}
 	return &PingPayload{
+		// 바이트를 숫자로 읽기!
 		Nonce: binary.BigEndian.Uint64(data),
 	}, nil
 }
@@ -56,10 +59,13 @@ func DecodePingPayload(data []byte) (*PingPayload, error) {
 // NewPingMessage는 Ping 메시지를 생성합니다.
 func NewPingMessage(nonce uint64) *Message {
 	payload := &PingPayload{Nonce: nonce}
+	// 숫자를 바이트로 인코드
 	data := payload.Encode()
 	return &Message{
 		Type:     MsgPing,
 		Payload:  data,
+		// 데이터가 손상됐는지 확인하는 "지문"을 만든 것이라고 한다.
+		// IEEE가 CRC32 계산에 쓰는 공식(다양식) 종류라고한다...
 		Checksum: crc32.ChecksumIEEE(data),
 	}
 }
