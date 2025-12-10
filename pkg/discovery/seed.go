@@ -114,14 +114,17 @@ func (sd *SeedDiscovery) Start() error {
 	sd.mu.Lock()
 	if sd.running {
 		sd.mu.Unlock()
-		return nil // 이미 실행 중
+		return nil // 이미 실행 중ㅃ
 	}
+	// 상태를 true로 만들고
 	sd.running = true
+	// 신호만 보내는 채널임 빈 구조체 채널
 	sd.stopCh = make(chan struct{})
 	sd.mu.Unlock()
 
 	// 백그라운드 피어 탐색 루프
 	sd.wg.Add(1)
+	// 이 루프가 도는데 Stop()을 불러서 이 루프를 정지 시킨다고 보면 된다890
 	go sd.discoveryLoop()
 
 	log.Printf("[Discovery] 시드 디스커버리 시작 (시드: %d개)", len(sd.seeds))
@@ -136,6 +139,7 @@ func (sd *SeedDiscovery) Stop() error {
 		return nil
 	}
 	sd.running = false
+	// close 하면 채널 상태 자체를 close로 닫아서 모든거 꺠움
 	close(sd.stopCh)
 	sd.mu.Unlock()
 

@@ -133,12 +133,14 @@ func NewGossipDiscovery(seeds []string, localAddr string, config *Config, gossip
 	}
 
 	gd := &GossipDiscovery{
+		// 시드 불러오기 
 		SeedDiscovery: NewSeedDiscovery(seeds, localAddr, config),
 		gossipConfig:  gc,
 		recentGossip:  make(map[string]time.Time),
 		gossipStopCh:  make(chan struct{}),
 	}
 
+	// 가십디스커버리 리턴
 	return gd
 }
 
@@ -164,16 +166,21 @@ func (gd *GossipDiscovery) Start() error {
 		return err
 	}
 
+	// 락걸리
 	gd.mu.Lock()
+	// 얘 살아있으면 걍 리턴 
 	if gd.gossipRunning {
 		gd.mu.Unlock()
 		return nil
 	}
+	// 죽어있으면 true 바꿈
 	gd.gossipRunning = true
+	// 이거 멈추는 채널 만드는데 close 쓸라고 걍 빈 구조체임.
 	gd.gossipStopCh = make(chan struct{})
 	gd.mu.Unlock()
 
 	// 가십 루프 시작
+	// 근데 공부하면서 안건데 먼저 Wg에 더해야됨. 왜냐하면 Wg는 애초부터 고루틴을 신경안씀 걍 원자적으로 카운트만 올림 그래서 gossipLoop() 에서 끝날 때 defer gd.gossipWg.Done() 해주는거임!
 	gd.gossipWg.Add(1)
 	go gd.gossipLoop()
 
