@@ -373,7 +373,9 @@ func (sd *SeedDiscovery) OnEvent(handler EventHandler) {
 // emitEventLocked는 이벤트를 발생시킵니다.
 // mu가 이미 잠겨있는 상태에서 호출해야 합니다.
 func (sd *SeedDiscovery) emitEventLocked(event Event) {
+	// 읽기락 걸고
 	sd.handlerMu.RLock()
+	// len(sd.eventHandlers)만큼 배열 만듬
 	handlers := make([]EventHandler, len(sd.eventHandlers))
 	copy(handlers, sd.eventHandlers)
 	sd.handlerMu.RUnlock()
