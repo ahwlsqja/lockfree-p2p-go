@@ -190,6 +190,7 @@ func (gd *GossipDiscovery) Start() error {
 
 // Stop은 가십 디스커버리를 중지합니다.
 func (gd *GossipDiscovery) Stop() error {
+	// 일단 락걸고 아까랑 똑같이 함 스타트랑
 	gd.mu.Lock()
 	if gd.gossipRunning {
 		gd.gossipRunning = false
@@ -214,11 +215,15 @@ func (gd *GossipDiscovery) gossipLoop() {
 	// 랜덤 딜레이로 분산시킴
 	jitter := time.Duration(rand.Int63n(int64(gd.gossipConfig.GossipInterval / 4)))
 	select {
+		// 이 타임 함수 자체가 채널을 만들어서 한다고 한다. 
+		// func After(d Duration) <-chan Time 이렇게 정의되어 있대요
+		// time.After(jitter) 자체가 채널 객체임
 	case <-time.After(jitter):
 	case <-gd.gossipStopCh:
 		return
 	}
 
+	// 이거 자체가 주기적으로 신호를 보내는 타이머 객체를 생성해서 반환하는 친구임
 	ticker := time.NewTicker(gd.gossipConfig.GossipInterval)
 	defer ticker.Stop()
 
@@ -267,14 +272,15 @@ func (gd *GossipDiscovery) doGossip() {
 	log.Printf("[Discovery] 가십 완료: %d개 피어 정보 전파", len(peersToGossip))
 }
 
-// selectPeersToGossip은 가십할 피어 정보를 선택합니다.
+// selectPeersToGossip은 가십할 피어 정보를 선택합니다. 가십한 피어정보들 다 모아서 후보군 랜덤
 //
 // [선택 기준]
-// 1. 최근에 가십하지 않은 피어
+// 1. 최근에 가십하지 않은 피어 (그니까 최신에 가십을 보내지않은 피어)
 // 2. 최대 MaxGossipPeers개
 // 3. 랜덤 섞기 (다양성 확보)
 func (gd *GossipDiscovery) selectPeersToGossip() []*PeerInfo {
 	gd.mu.RLock()
+	// 현재 알고 있는 모든 피어 정보(gd.peers 맵의 값들)를 슬라이스(allPeers)로 복사하여 잠금 없이 나머지 작업을 진행할 수 있도록 준비합니다.
 	allPeers := make([]*PeerInfo, 0, len(gd.peers))
 	for _, peer := range gd.peers {
 		allPeers = append(allPeers, peer)
@@ -288,6 +294,7 @@ func (gd *GossipDiscovery) selectPeersToGossip() []*PeerInfo {
 	now := time.Now()
 	candidates := make([]*PeerInfo, 0, len(allPeers))
 	for _, peer := range allPeers {
+		// 가십 안됬거나 TTL 보다 오랜기간 지나면 후보군에 넣음
 		lastGossip, exists := gd.recentGossip[peer.Addr]
 		if !exists || now.Sub(lastGossip) > gd.gossipConfig.GossipTTL {
 			candidates = append(candidates, peer)
@@ -295,6 +302,7 @@ func (gd *GossipDiscovery) selectPeersToGossip() []*PeerInfo {
 	}
 
 	// 랜덤 섞기
+	// 후보군의 순서를 완전히 무작위로 시킴
 	rand.Shuffle(len(candidates), func(i, j int) {
 		candidates[i], candidates[j] = candidates[j], candidates[i]
 	})
@@ -309,6 +317,7 @@ func (gd *GossipDiscovery) selectPeersToGossip() []*PeerInfo {
 
 // cleanupRecentGossip은 오래된 가십 캐시를 정리합니다.
 func (gd *GossipDiscovery) cleanupRecentGossip() {
+	// gd.mu.RLock()을 사용하여 SeedDiscovery에 포함된 전체 피어 목록(gd.peers)에 대한 읽기 잠금을 획득
 	gd.gossipMu.Lock()
 	defer gd.gossipMu.Unlock()
 
