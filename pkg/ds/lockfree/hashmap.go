@@ -143,12 +143,16 @@ func (m *HashMap) getBucket(hash uint64) uint32 {
 // - 평균: O(1) (버킷당 평균 요소 수가 상수)
 // - 최악: O(n) (모든 요소가 한 버킷에)
 func (m *HashMap) Get(key string) (interface{}, bool) {
+	// 해시화
 	hash := hashKey(key)
+	// 해시넣어서 value 꺼내기
 	bucketIdx := m.getBucket(hash)
 
 	// 버킷 시작점 가져오기
 	var curr *hashNode
+	// 아토믹 포인터로 가져오기 아까 그 버킷 인덱스
 	bucketPtr := atomic.LoadPointer(&m.buckets[bucketIdx])
+	// 버킷 포인트가 nil이 아니면 curr 은 bucketPrt을 현재로 함. buckerPtr에 있는건 맨 처음 head임
 	if bucketPtr != nil {
 		curr = (*hashNode)(bucketPtr)
 	} else {
@@ -176,6 +180,7 @@ func (m *HashMap) Get(key string) (interface{}, bool) {
 			return nil, false
 		}
 
+		// 그 다음 노드가 curr임.
 		curr = (*hashNode)(atomic.LoadPointer(&curr.next))
 	}
 
