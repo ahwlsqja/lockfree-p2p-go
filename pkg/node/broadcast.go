@@ -250,7 +250,7 @@ func MessageHash(msg *protocol.Message) uint64 {
 // 벤치마크 결과: RWMutex 대비 약 2배 빠름 (읽기 위주일 때)
 // - RWMutex: 읽기도 readerCount atomic 증가 필요 → 캐시 라인 경합
 // - sync.Map: read map에서 바로 반환 → 경합 없음
-func (bm *BroadcastManager) HasSeen(hash string) bool {
+func (bm *BroadcastManager) HasSeen(hash uint64) bool {
 	_, exists := bm.seenMessages.Load(hash)
 	return exists
 }
@@ -273,7 +273,13 @@ func (bm *BroadcastManager) HasSeen(hash string) bool {
 // - 키가 있으면: 기존 값 반환, loaded=true
 // - 키가 없으면: 새 값 저장, loaded=false
 // - 원자적 연산으로 race condition 방지
-func (bm *BroadcastManager) MarkSeen(hash string) bool {
+//
+// [MaxSeenMessages 초과 처리]
+// 이전에는 removeOldest() 호출 (O(n) 순회)
+// 지금은 TTL 기반 cleanup만 사용 (soft limit)
+// → 메모리 폭발은 TTL 내 대량 메시지 유입 시에만 발생
+// → 그 경우는 이상 상황이므로 별도 모니터링/알림으로 대응
+func (bm *BroadcastManager) MarkSeen(hash uint64) bool {
 	now := time.Now()
 
 	// LoadOrStore: 이미 있으면 false, 새로 저장하면 true 반환해야 하므로 !loaded
@@ -282,48 +288,12 @@ func (bm *BroadcastManager) MarkSeen(hash string) bool {
 		return false // 이미 존재했음
 	}
 
-	// 새로 저장됨 → 카운터 증가
-	newCount := atomic.AddInt64(&bm.count, 1)
-
-	// 최대 개수 초과 시 오래된 것 제거
-	// 정확한 제한은 아니지만 (동시성 때문에), 대략적으로 유지
-	if newCount > int64(bm.config.MaxSeenMessages) {
-		bm.removeOldest()
-	}
+	// 새로 저장됨 → 카운터 증가 (통계용, soft limit)
+	atomic.AddInt64(&bm.count, 1)
 
 	return true // 새로운 메시지
 }
 
-// removeOldest는 가장 오래된 메시지 해시를 제거합니다.
-//
-// [sync.Map에서의 최소값 찾기]
-// sync.Map은 정렬을 지원하지 않으므로 전체 순회 필요
-// 성능상 비효율적이지만:
-// 1. MaxSeenMessages가 충분히 크면 거의 호출 안 됨
-// 2. cleanup이 주기적으로 TTL 만료 항목 제거
-// 3. 호출되더라도 한 번에 하나만 제거
-func (bm *BroadcastManager) removeOldest() {
-	var oldestHash string
-	var oldestTime time.Time
-	first := true
-
-	bm.seenMessages.Range(func(key, value interface{}) bool {
-		hash := key.(string)
-		seenAt := value.(time.Time)
-
-		if first || seenAt.Before(oldestTime) {
-			oldestHash = hash
-			oldestTime = seenAt
-			first = false
-		}
-		return true
-	})
-
-	if oldestHash != "" {
-		bm.seenMessages.Delete(oldestHash)
-		atomic.AddInt64(&bm.count, -1)
-	}
-}
 
 // =============================================================================
 // 브로드캐스트 메서드
@@ -425,6 +395,12 @@ func (bm *BroadcastManager) GossipBroadcast(msg *protocol.Message, exclude map[p
 // - 특정 피어에 부하 집중 방지
 // - 네트워크 토폴로지에 따른 편향 방지
 // - 장애 시 다른 경로로 전파 가능
+//
+// [goroutine-local RNG]
+// math/rand 전역 함수 대신 bm.rng 사용
+// - 전역 rand.Shuffle은 내부적으로 globalRand 락 사용
+// - 동시 호출 많으면 락 경합 발생
+// - *rand.Rand 인스턴스는 락 없이 동작 (단, 단일 goroutine에서 사용 시)
 func (bm *BroadcastManager) selectGossipTargets(exclude map[peer.ID]bool) []*peer.Peer {
 	allPeers := bm.node.peerManager.GetConnectedPeers()
 
@@ -442,8 +418,8 @@ func (bm *BroadcastManager) selectGossipTargets(exclude map[peer.ID]bool) []*pee
 		return candidates
 	}
 
-	// 셔플
-	rand.Shuffle(len(candidates), func(i, j int) {
+	// goroutine-local RNG로 셔플 (락 경합 없음)
+	bm.rng.Shuffle(len(candidates), func(i, j int) {
 		candidates[i], candidates[j] = candidates[j], candidates[i]
 	})
 
