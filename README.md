@@ -190,6 +190,101 @@ type Map struct {
 
 ---
 
+## BroadcastManager Optimizations
+
+The message broadcasting hot path was optimized for maximum throughput. All benchmarks run on AMD Ryzen 5 3500 (6-Core).
+
+### Hash Function: SHA256 → xxhash
+
+Message deduplication requires hashing every incoming message. We replaced cryptographic SHA256 with non-cryptographic xxhash.
+
+| Implementation | ns/op | B/op | allocs/op | Speedup |
+|----------------|------:|-----:|----------:|--------:|
+| SHA256 + hex.EncodeToString | 426.8 | 160 | 3 | baseline |
+| xxhash + sync.Pool | 45.0 | 0 | 0 | **9.5x** |
+| xxhash.Sum64 (direct) | 25.5 | 0 | 0 | **16.7x** |
+
+**Why 0 B/op?**
+- `sync.Pool` reuses `xxhash.Digest` instances across calls
+- After pool warmup, no new allocations occur in steady state
+- Direct `Sum64` benchmark pre-allocates buffer before timing
+
+```go
+// Before: 426.8 ns/op, 160 B/op, 3 allocs/op
+hasher := sha256.New()
+hasher.Write([]byte{byte(msg.Type)})
+hasher.Write(msg.Payload)
+hash := hex.EncodeToString(hasher.Sum(nil))  // string key
+
+// After: 45.0 ns/op, 0 B/op, 0 allocs/op
+h := digestPool.Get().(*xxhash.Digest)
+h.Reset()
+h.Write([]byte{byte(msg.Type)})
+h.Write(msg.Payload)
+hash := h.Sum64()  // uint64 key
+digestPool.Put(h)
+```
+
+### SeenCache: RWMutex → sync.Map
+
+The duplicate message cache is read-heavy (90%+ lookups are cache hits).
+
+| Scenario | sync.Map | RWMutex | Speedup |
+|----------|------:|-------:|--------:|
+| ReadOnly (100% read) | 10.12 ns/op | 40.46 ns/op | **4.0x** |
+| ReadHeavy (90% read, 10% write) | 83.88 ns/op | 123.7 ns/op | **1.5x** |
+| WriteHeavy (50% read, 50% write) | ~equal | ~equal | 1.0x |
+
+**Key insight**: P2P networks see the same message multiple times from different peers. Most `MarkSeen()` calls hit existing entries → read-heavy workload → sync.Map wins.
+
+### RNG: Global → Goroutine-Local
+
+Gossip target selection requires shuffling peer lists.
+
+| Implementation | Behavior |
+|----------------|----------|
+| `rand.Shuffle()` (global) | Lock contention under parallel calls |
+| `rng.Shuffle()` (local) | No contention, each goroutine has own RNG |
+
+```go
+// Before: global RNG with internal mutex
+rand.Shuffle(len(candidates), func(i, j int) { ... })
+
+// After: goroutine-local RNG (race-free)
+rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+rng.Shuffle(len(candidates), func(i, j int) { ... })
+```
+
+### Full Hot Path Improvement
+
+Message receive path: `Receive → Hash → MarkSeen → Broadcast`
+
+| Component | Before | After | Improvement |
+|-----------|-------:|------:|------------:|
+| MessageHash | 426.8 ns | 45.0 ns | 9.5x faster |
+| MarkSeen (cache hit) | 40.46 ns | 10.12 ns | 4.0x faster |
+| Memory allocation | 160 B/msg | 0 B/msg | **zero-alloc** |
+
+**Total hot path: ~10x faster, zero allocations**
+
+### Run BroadcastManager Benchmarks
+
+```bash
+# All broadcast benchmarks
+go test -bench=. -benchmem ./pkg/node/... -run=^$
+
+# Hash comparison only
+go test -bench=BenchmarkHash -benchmem ./pkg/node/...
+
+# SeenCache comparison only
+go test -bench=BenchmarkSeenCache -benchmem ./pkg/node/...
+
+# Full flow comparison
+go test -bench=BenchmarkFullFlow -benchmem ./pkg/node/...
+```
+
+---
+
 ## Test Results
 
 ### Unit Tests

@@ -211,24 +211,45 @@ func (bm *BroadcastManager) cleanup() {
 // - 메모리: 8바이트 vs 64바이트(hex string)
 //
 // [Birthday Paradox 계산]
-// n개 메시지에서 충돌 확률 ≈ n² / (2 * 2^64)
-// - 100,000개: 0.00000027% (무시 가능)
-// - 1,000,000개: 0.000027%
-// - 1억개: 0.27%
+// n개 메시지에서 충돌 확률 ≈ n² / 2^65  (= n² / (2 * 2^64))
+// - 10만개:  ~2.7e-10 (무시 가능)
+// - 100만개: ~2.7e-8
+// - 1억개:   ~2.7e-4 (0.027%)
+// digestPool은 xxhash.Digest를 재사용하기 위한 풀입니다.
+//
+// [왜 풀링?]
+// MessageHash는 핫패스 (모든 수신 메시지마다 호출)
+// xxhash.New()는 매번 ~128B Digest 할당
+// sync.Pool로 재사용하면 GC 부담 대폭 감소
+//
+// [sync.Pool 특성]
+// - Get: 풀에 있으면 반환, 없으면 New 호출
+// - Put: 풀에 반환 (GC가 언제든 회수 가능)
+// - goroutine-safe
+var digestPool = sync.Pool{
+	New: func() interface{} {
+		return xxhash.New()
+	},
+}
+
 func MessageHash(msg *protocol.Message) uint64 {
-	// xxhash.Sum64는 단일 슬라이스에서 직접 해시 계산
-	// xxhash.New() + Write() + Sum64()보다 빠름 (Digest 할당 없음)
-	//
-	// [왜 Type을 Payload 앞에 붙이나?]
-	// 같은 Payload라도 Type이 다르면 다른 해시 → 충돌 방지
-	// 예: Tx와 Block이 같은 데이터를 가질 가능성 (이론적)
-	//
-	// [할당 최소화]
-	// Payload가 크면 append가 재할당할 수 있음
-	// 하지만 대부분의 메시지는 작으므로 (< 1KB) 괜찮음
-	// 초대형 메시지가 잦으면 sync.Pool로 버퍼 풀링 고려
-	data := append([]byte{byte(msg.Type)}, msg.Payload...)
-	return xxhash.Sum64(data)
+	// 풀에서 Digest 가져오기 (할당 없음, 또는 최초 1회만)
+	h := digestPool.Get().(*xxhash.Digest)
+
+	// 반드시 Reset 후 사용 (이전 데이터 제거)
+	h.Reset()
+
+	// Type + Payload 해시 (2번의 Write, 추가 할당 없음)
+	// 같은 Payload라도 Type이 다르면 다른 해시
+	h.Write([]byte{byte(msg.Type)})
+	h.Write(msg.Payload)
+
+	sum := h.Sum64()
+
+	// 풀에 반환 (재사용 가능하게)
+	digestPool.Put(h)
+
+	return sum
 }
 
 // HasSeen은 메시지를 이미 봤는지 확인합니다.
