@@ -64,20 +64,6 @@ type BroadcastManager struct {
 	// sync.Map은 Len()을 지원하지 않으므로 별도 카운터 필요
 	count int64
 
-	// rng는 goroutine-local 난수 생성기입니다.
-	//
-	// [왜 goroutine-local?]
-	// math/rand 전역 함수는 내부적으로 락을 사용함
-	// 동시 호출이 많으면 락 경합 발생
-	// goroutine별 *rand.Rand를 사용하면 경합 없음
-	//
-	// [주의]
-	// 이 필드는 BroadcastManager 생성 시 초기화됨
-	// 여러 goroutine이 동시에 접근할 수 있지만,
-	// selectGossipTargets는 보통 단일 goroutine에서 호출됨
-	// 만약 동시 호출이 많아지면 sync.Pool로 RNG 풀링 고려
-	rng *rand.Rand
-
 	// config는 브로드캐스트 설정입니다.
 	config BroadcastConfig
 
@@ -134,9 +120,6 @@ func NewBroadcastManager(node *Node, config *BroadcastConfig) *BroadcastManager 
 		node:   node,
 		config: cfg,
 		stopCh: make(chan struct{}),
-		// goroutine-local RNG 초기화
-		// 시드로 현재 시간의 나노초 사용 (충분히 랜덤)
-		rng: rand.New(rand.NewSource(time.Now().UnixNano())),
 		// seenMessages는 sync.Map이므로 초기화 불필요 (zero value가 유효)
 	}
 }
@@ -233,11 +216,19 @@ func (bm *BroadcastManager) cleanup() {
 // - 1,000,000개: 0.000027%
 // - 1억개: 0.27%
 func MessageHash(msg *protocol.Message) uint64 {
-	// xxhash는 내부적으로 SIMD 최적화됨
-	h := xxhash.New()
-	h.Write([]byte{byte(msg.Type)})
-	h.Write(msg.Payload)
-	return h.Sum64()
+	// xxhash.Sum64는 단일 슬라이스에서 직접 해시 계산
+	// xxhash.New() + Write() + Sum64()보다 빠름 (Digest 할당 없음)
+	//
+	// [왜 Type을 Payload 앞에 붙이나?]
+	// 같은 Payload라도 Type이 다르면 다른 해시 → 충돌 방지
+	// 예: Tx와 Block이 같은 데이터를 가질 가능성 (이론적)
+	//
+	// [할당 최소화]
+	// Payload가 크면 append가 재할당할 수 있음
+	// 하지만 대부분의 메시지는 작으므로 (< 1KB) 괜찮음
+	// 초대형 메시지가 잦으면 sync.Pool로 버퍼 풀링 고려
+	data := append([]byte{byte(msg.Type)}, msg.Payload...)
+	return xxhash.Sum64(data)
 }
 
 // HasSeen은 메시지를 이미 봤는지 확인합니다.
@@ -288,8 +279,23 @@ func (bm *BroadcastManager) MarkSeen(hash uint64) bool {
 		return false // 이미 존재했음
 	}
 
-	// 새로 저장됨 → 카운터 증가 (통계용, soft limit)
-	atomic.AddInt64(&bm.count, 1)
+	// 새로 저장됨 → 카운터 증가
+	newCount := atomic.AddInt64(&bm.count, 1)
+
+	// soft limit 초과 감지 (로그만, 차단 안 함)
+	// TTL cleanup이 주된 방어선이므로 여기서는 모니터링만
+	//
+	// [프로덕션에서는]
+	// - rate-limited 로그 사용 (초당 1회 등)
+	// - 메트릭 export (Prometheus 등)
+	// - 알림 트리거
+	if bm.config.MaxSeenMessages > 0 && newCount > int64(bm.config.MaxSeenMessages) {
+		// 매번 로그 찍으면 폭주하므로 1000개마다만
+		if newCount%1000 == 0 {
+			log.Printf("[BroadcastManager] soft limit 초과: %d > %d (TTL cleanup 대기 중)",
+				newCount, bm.config.MaxSeenMessages)
+		}
+	}
 
 	return true // 새로운 메시지
 }
@@ -396,11 +402,14 @@ func (bm *BroadcastManager) GossipBroadcast(msg *protocol.Message, exclude map[p
 // - 네트워크 토폴로지에 따른 편향 방지
 // - 장애 시 다른 경로로 전파 가능
 //
-// [goroutine-local RNG]
-// math/rand 전역 함수 대신 bm.rng 사용
+// [로컬 RNG 사용]
+// *rand.Rand는 goroutine-safe가 아니므로 필드로 저장하면 race condition 발생
+// 대신 함수 내에서 로컬 RNG 생성 (비용 무시 가능: fanout 셔플 정도는 충분히 빠름)
+//
+// [왜 전역 rand.Shuffle 안 쓰나?]
 // - 전역 rand.Shuffle은 내부적으로 globalRand 락 사용
 // - 동시 호출 많으면 락 경합 발생
-// - *rand.Rand 인스턴스는 락 없이 동작 (단, 단일 goroutine에서 사용 시)
+// - 로컬 RNG는 경합 없음
 func (bm *BroadcastManager) selectGossipTargets(exclude map[peer.ID]bool) []*peer.Peer {
 	allPeers := bm.node.peerManager.GetConnectedPeers()
 
@@ -418,8 +427,9 @@ func (bm *BroadcastManager) selectGossipTargets(exclude map[peer.ID]bool) []*pee
 		return candidates
 	}
 
-	// goroutine-local RNG로 셔플 (락 경합 없음)
-	bm.rng.Shuffle(len(candidates), func(i, j int) {
+	// 로컬 RNG로 셔플 (race-free)
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	rng.Shuffle(len(candidates), func(i, j int) {
 		candidates[i], candidates[j] = candidates[j], candidates[i]
 	})
 
